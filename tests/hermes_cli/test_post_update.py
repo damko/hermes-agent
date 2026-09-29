@@ -3,7 +3,7 @@
 These assert behavior contracts, not snapshots: the registries' scopes must
 match what boot_bootstrap gates them with, a failing step must not stop the
 rest, and step_migrate_config must restore its backups when a migration
-fails or does not advance the version.
+fails or does not advance the version, and drop them when it succeeds.
 """
 from pathlib import Path
 
@@ -99,6 +99,51 @@ def test_migrate_config_restores_backup_when_version_does_not_advance(
     assert config_path.read_text(encoding="utf-8") == "_config_version: 20\n"
     backups = list(tmp_path.glob("config.yaml.bak-*"))
     assert backups, "backup file must exist"
+
+
+def test_migrate_config_success_leaves_no_backup_copies(tmp_path, monkeypatch):
+    """A verified migration drops its own rollback pair.
+
+    The pair exists for the in-run rollback only, and the ``.env`` copy is a
+    whole credential store: leaving it behind put a second full copy of every
+    key of every migrated home on disk, one pair per home per version bump.
+    """
+    import hermes_cli.config as cfg
+    import hermes_cli.config_migrations as mig
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("_config_version: 20\n", encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("EXAMPLE_KEY=test\n", encoding="utf-8")
+
+    floor = getattr(mig, "SUPPORT_FLOOR_VERSION", 12)
+    current = max(20, floor)
+    versions = iter([(current, 34), (34, 34)])
+    monkeypatch.setattr(cfg, "check_config_version", lambda: next(versions))
+    monkeypatch.setattr(cfg, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(cfg, "get_env_path", lambda: env_path)
+
+    during: list[list[str]] = []
+
+    def fake_migrate(**kw):
+        # Both copies must exist while the migration runs, or this test would
+        # pass against a run that simply never wrote a backup at all.
+        during.append(sorted(p.name for p in tmp_path.glob("*.bak-*")))
+        config_path.write_text("_config_version: 34\n", encoding="utf-8")
+
+    monkeypatch.setattr(cfg, "migrate_config", lambda **kw: fake_migrate(**kw))
+
+    result = step_migrate_config()
+
+    assert result == {"ok": True, "migrated": f"{current}->34"}
+    assert len(during) == 1 and len(during[0]) == 2, during
+    assert during[0][0].startswith(".env.bak-")
+    assert during[0][1].startswith("config.yaml.bak-")
+    assert list(tmp_path.glob("config.yaml.bak-*")) == []
+    assert list(tmp_path.glob(".env.bak-*")) == []
+    # Only the copies go: the live files stay exactly as the migration left them.
+    assert config_path.read_text(encoding="utf-8") == "_config_version: 34\n"
+    assert env_path.read_text(encoding="utf-8") == "EXAMPLE_KEY=test\n"
 
 
 # ── step_state_db_guard ──────────────────────────────────────────────

@@ -149,7 +149,14 @@ print(json.dumps(boot_bootstrap.run_boot_bootstrap(root)))
         again = subprocess.run([*command, "go"], env=env, capture_output=True, text=True, timeout=30)
         assert json.loads(again.stdout.splitlines()[-1]) == {"home": "skipped"}
         for directory in {home, other}:
-            assert len(list(directory.glob("config.yaml.bak-*"))) == 1
+            # The migration ran (the version advanced) and kept no rollback
+            # copy: the pair exists for the in-run rollback only, and its
+            # .env half would be a second full credential store.
+            import hermes_yaml
+            assert hermes_yaml.safe_load(
+                (directory / "config.yaml").read_text()
+            )["_config_version"] == DEFAULT_CONFIG["_config_version"]
+            assert list(directory.glob("*.bak-*")) == []
             with sqlite3.connect(directory / "state.db") as db:
                 assert db.execute("SELECT value FROM retained").fetchall() == [("before",)]
         # A changed artifact or Git identity must run the real migration again.

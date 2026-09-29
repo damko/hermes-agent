@@ -58,11 +58,36 @@ def _restore_backups(backups: dict) -> list:
     return restored
 
 
+def _discard_backups(backups: dict) -> list:
+    """Delete this run's rollback copies once the migration is verified.
+
+    The copies exist for the in-run rollback only: nothing reads a
+    ``<file>.bak-<stamp>`` back, and the ``.env`` copy is a whole credential
+    store — one per migrated home, one pair per version bump. The failure
+    path keeps them (``_restore_backups`` runs first and the files stay for
+    inspection), so this is the success path only. Best effort: a copy that
+    cannot be removed is logged, never raised — the migration already
+    succeeded and must not be reported as failed over cleanup.
+    """
+    removed = []
+    for backup in backups.values():
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("could not remove migration backup %s: %s", backup, exc)
+            continue
+        removed.append(backup)
+    if removed:
+        logger.debug("removed %d migration backup copy(ies)", len(removed))
+    return removed
+
+
 def step_migrate_config() -> dict:
     """Migrate config.yaml to the current schema, non-interactively.
 
     Same shape as scripts/docker_config_migrate.py: back up config + .env,
-    migrate, verify the version advanced, restore the backups on failure.
+    migrate, verify the version advanced, restore the backups on failure and
+    drop them on success (they exist for the in-run rollback only).
     No-op when the on-disk version is current (the 99% case).
     """
     from hermes_cli.config import (
@@ -99,6 +124,7 @@ def step_migrate_config() -> dict:
             f"(still {post_ver}); restored: "
             + (", ".join(str(p) for p in restored) if restored else "none")
         )
+    _discard_backups(backups)
     return {"ok": True, "migrated": f"{current_ver}->{latest_ver}"}
 
 

@@ -44,6 +44,28 @@ def _restore_backups(backups: dict[Path, Path]) -> list[Path]:
     return restored
 
 
+def _discard_backups(backups: dict[Path, Path]) -> list[Path]:
+    """Drop this run's pre-migration copies once the migration is verified.
+
+    They exist for the in-run rollback only — nothing reads a
+    ``pre-docker-migrate`` copy back (``load_newest_good_backup`` serves the
+    ``good`` reason) — and the ``.env`` copy is a whole credential store that
+    would otherwise sit in the volume for the life of the install. The failure
+    path keeps them (``_restore_backups`` runs first, the files stay for
+    inspection). Best effort: a copy that cannot be removed is reported, never
+    raised — the migration already succeeded.
+    """
+    removed: list[Path] = []
+    for backup in backups.values():
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"[config-migrate] could not remove backup {backup}: {exc}", file=sys.stderr)
+            continue
+        removed.append(backup)
+    return removed
+
+
 def main() -> int:
     if env_var_enabled("HERMES_SKIP_CONFIG_MIGRATION"):
         print("[config-migrate] HERMES_SKIP_CONFIG_MIGRATION is set; skipping config migration")
@@ -98,6 +120,12 @@ def main() -> int:
         raise RuntimeError(
             f"migration did not advance config version to {latest_ver} "
             f"(still {post_ver}); restored: {restored_text}"
+        )
+    removed = _discard_backups(backups)
+    if removed:
+        print(
+            "[config-migrate] Verified; dropped this run's rollback copies: "
+            + ", ".join(str(path) for path in removed)
         )
     return 0
 

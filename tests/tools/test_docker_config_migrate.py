@@ -42,7 +42,7 @@ def _run_migration(hermes_home: Path, **env_overrides: str) -> subprocess.Comple
     )
 
 
-def test_docker_config_migrate_backs_up_and_migrates_legacy_config(tmp_path: Path) -> None:
+def test_docker_config_migrate_migrates_and_drops_the_rollback_pair(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     env_path = tmp_path / ".env"
     config_path.write_text(
@@ -68,8 +68,12 @@ def test_docker_config_migrate_backs_up_and_migrates_legacy_config(tmp_path: Pat
     # max_async_children into max_concurrent_children.
     assert "ttl_hours" not in raw["model_catalog"]
     assert raw["delegation"] == {"max_concurrent_children": 8}
-    assert list((tmp_path / "backups" / "config").glob("config.yaml.pre-docker-migrate.*"))
-    assert list((tmp_path / "backups" / "config").glob(".env.pre-docker-migrate.*"))
+    # The pre-migration pair is the in-run rollback only: a verified migration
+    # drops it, so neither a config copy nor a whole copy of the credential
+    # store (.env) is left behind in the volume.
+    assert not list((tmp_path / "backups" / "config").glob("*pre-docker-migrate*"))
+    assert not list(tmp_path.glob("*.bak-*"))
+    assert env_path.read_text(encoding="utf-8") == "OPENROUTER_API_KEY=test\n"
 
 
 def test_docker_config_migrate_skips_below_floor_config_untouched(tmp_path: Path) -> None:
@@ -249,7 +253,8 @@ def test_docker_config_migrate_second_boot_preserves_env_byte_for_byte(tmp_path:
     assert env_path.read_bytes() == env_bytes_before
 
     config_after_first = config_path.read_bytes()
-    first_boot_backups = sorted((tmp_path / "backups" / "config").glob("config.yaml.pre-docker-migrate.*"))
+    # A verified migration keeps no rollback copy (see the success-path test).
+    assert not list((tmp_path / "backups" / "config").glob("*pre-docker-migrate*"))
 
     # ── Second boot (host reboot): version is current, must be a no-op. ──
     second = _run_migration(tmp_path)
@@ -258,6 +263,7 @@ def test_docker_config_migrate_second_boot_preserves_env_byte_for_byte(tmp_path:
     # .env is still present and byte-for-byte identical to the original.
     assert env_path.exists()
     assert env_path.read_bytes() == env_bytes_before
-    # config.yaml is untouched by the second boot, and no new backup is made.
+    # config.yaml is untouched by the second boot, and no backup is made.
     assert config_path.read_bytes() == config_after_first
-    assert sorted((tmp_path / "backups" / "config").glob("config.yaml.pre-docker-migrate.*")) == first_boot_backups
+    assert not list((tmp_path / "backups" / "config").glob("*pre-docker-migrate*"))
+    assert not list(tmp_path.glob("*.bak-*"))
