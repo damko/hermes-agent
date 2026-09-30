@@ -117,18 +117,54 @@ def message_agent_tool_schema() -> dict:
     }
 
 
+# Sessions that must NOT get the DM tool: a kanban worker turn has no live surface to
+# receive the answer, and its consultation lane is the card (shared conventions
+# §Consultation). FORK ADDITION, damko 2026-09-30.
+_DM_EXCLUDED_SOURCES = frozenset({"kanban"})
+
+
+def dm_worker_excluded(agent: Any) -> bool:
+    """True when this turn belongs to an excluded automation source (kanban worker).
+
+    Reads the identifier the dispatcher stamps on a worker turn
+    (``HERMES_SESSION_SOURCE=kanban``, ``hermes_cli/kanban_db_dispatch.py``) through the
+    gateway's ContextVar-aware accessor, so a gateway-hosted worker is seen too. This
+    deliberately does NOT go through ``run_agent._session_source_for_agent``: that import
+    can fail outside a live agent process, and a gate must not depend on it. An
+    unrecognised or unreadable value INCLUDES the session — on doubt the tool stays, it is
+    never silently removed. Never raises."""
+    try:
+        try:
+            from gateway.session_context import get_session_env
+        except Exception:
+            get_session_env = os.environ.get  # type: ignore[assignment]
+        source = str(get_session_env("HERMES_SESSION_SOURCE", "") or "").strip().lower()
+        if not source:
+            source = str(os.environ.get("HERMES_SESSION_SOURCE", "") or "").strip().lower()
+        return source in _DM_EXCLUDED_SOURCES
+    except Exception:  # pragma: no cover — include on doubt
+        return False
+
+
 def message_agent_authorized(agent: Any) -> bool:
-    """The ``message_agent`` gate: a protocol-enabled agent whose session is a managed
-    Bot-Mode canonical Bot Chat. Session-stable, so it is prompt-cache safe to re-evaluate
-    on every tool-snapshot rebuild. Never raises."""
+    """The ``message_agent`` gate: a protocol-enabled agent on a Bot-Mode-managed install.
+
+    FORK PATCH (damko, 2026-09-30): the tool used to be injected ONLY into the canonical
+    ``Bot Chat``. It is now injected into EVERY session of a managed install, so sibilla,
+    claudio and every other agent can reach diogene from an ordinary session; the excluded
+    automation sources (``_DM_EXCLUDED_SOURCES``) keep their card lane. The gate stays a
+    pure function of session-stable inputs (install marker + session source), so it remains
+    prompt-cache safe to re-evaluate on every tool-snapshot rebuild. Never raises."""
     try:
         if not getattr(agent, "_bot_mode_protocol", True):
             return False
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+        from tools.bot_mode_probe import is_bot_mode_managed
 
         # Managed-install check, NOT section non-emptiness: a SOUL.md carrying the
         # legacy protocol text gets an empty section but must still get the tool.
-        return _session_title(agent) == BOT_CHAT_TITLE and is_bot_mode_managed(_agent_home(agent))
+        if not is_bot_mode_managed(_agent_home(agent)):
+            return False
+        return not dm_worker_excluded(agent)
     except Exception:  # pragma: no cover — must never break a turn
         logger.debug("message_agent_authorized failed", exc_info=True)
         return False
@@ -201,14 +237,14 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     home = _agent_home(agent)
     try:
         from tools.bot_mode_probe import (
-            BOT_CHAT_TITLE, _display_name, _handle, _hermes_root, _peers, _profile_name as _self_profile_name,
+            _display_name, _handle, _hermes_root, _peers, _profile_name as _self_profile_name,
             _roster, is_bot_mode_managed,
         )
         from tools.bot_relay import BOT_CHAT_TURN_ARGS, _hermes_cli
 
-        if _session_title(agent) != BOT_CHAT_TITLE:
-            return _err("message_agent is only available in a Bot Mode 'Bot Chat' session. "
-                        "This session is not one; do not retry.")
+        if dm_worker_excluded(agent):
+            return _err("message_agent is not available in a kanban worker turn — "
+                        "ask through a consultation card instead; do not retry.")
         if not is_bot_mode_managed(home):
             return _err("This install is not Bot-Mode-managed (no bot roster); "
                         "message_agent is unavailable. Do not retry.")

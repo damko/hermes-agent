@@ -73,7 +73,7 @@ class _FakeAgent:
 # ── injection gate (leak containment) ────────────────────────────────────────
 
 
-def test_injects_only_into_bot_chat_on_managed_install(tmp_path):
+def test_injects_into_a_bot_chat_on_managed_install(tmp_path):
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")
     assert bot_mode_dm.ensure_message_agent_tool(agent) is True
@@ -84,6 +84,39 @@ def test_injects_only_into_bot_chat_on_managed_install(tmp_path):
     # idempotent: second call adds nothing (byte-stable tool list per turn)
     assert bot_mode_dm.ensure_message_agent_tool(agent) is True
     assert len(agent.tools) == 1
+
+
+@pytest.mark.parametrize("title", ["", "My research chat", "Group: room-abc123", "handoff-12ab34cd"])
+def test_injects_into_an_ordinary_session_on_managed_install(tmp_path, title):
+    """FORK CONTRACT (damko 2026-09-30): sibilla, claudio and every other agent must be
+    able to reach diogene from an ORDINARY session — the tool is no longer Bot-Chat-only.
+    The teammate roster ships with it (agent/system_prompt.py, same predicate)."""
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title=title)
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is True
+    names = [t["function"]["name"] for t in agent.tools]
+    assert names == [bot_mode_dm.MESSAGE_AGENT_TOOL_NAME]
+    assert bot_mode_dm.MESSAGE_AGENT_TOOL_NAME in agent.valid_tool_names
+
+
+@pytest.mark.parametrize("source", ["desktop", "cli", "oneshot", "cron", "telegram"])
+def test_ordinary_sources_are_not_worker_excluded(tmp_path, monkeypatch, source):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", source)
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Any session")
+    assert bot_mode_dm.dm_worker_excluded(agent) is False
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is True
+
+
+def test_kanban_worker_turn_gets_no_tool(tmp_path, monkeypatch):
+    """A worker turn keeps its card lane: its session has no live surface for the answer."""
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="kanban task t_abc")
+    assert bot_mode_dm.dm_worker_excluded(agent) is True
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
 
 
 def test_restores_allowlist_when_schema_survives_surface_refresh(tmp_path):
@@ -114,9 +147,10 @@ def test_restores_allowlist_when_schema_survives_surface_refresh(tmp_path):
     "title",
     ["", "My research chat", "Group: room-abc123", "handoff-12ab34cd"],
 )
-def test_never_injects_outside_bot_chat(tmp_path, title):
-    """CLI sessions, ordinary chats, group-room member sessions: no tool."""
-    home = _managed_home(tmp_path)
+def test_never_injects_on_an_unmanaged_install_for_any_title(tmp_path, title):
+    """A plain install stays tool-free in every session — the install marker is the gate."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
     agent = _FakeAgent(home, title=title)
     assert bot_mode_dm.ensure_message_agent_tool(agent) is False
     assert agent.tools == []
@@ -154,14 +188,16 @@ def test_schema_never_in_global_registry():
 # ── dispatch gate (defense in depth) ─────────────────────────────────────────
 
 
-def test_tool_refuses_outside_bot_chat(tmp_path):
+def test_tool_refuses_a_kanban_worker_turn(tmp_path, monkeypatch):
+    """Defense in depth for the one excluded source (fork contract 2026-09-30)."""
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
     home = _managed_home(tmp_path)
-    agent = _FakeAgent(home, title="Ordinary chat")
+    agent = _FakeAgent(home, title="kanban task t_abc")
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
     )
     assert "error" in result
-    assert "Bot Chat" in result["error"]
+    assert "consultation card" in result["error"]
 
 
 def test_tool_refuses_on_unmanaged_install(tmp_path):
