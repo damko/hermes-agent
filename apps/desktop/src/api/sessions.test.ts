@@ -21,6 +21,7 @@ const {
   deleteSession,
   getSession,
   getLatestSessionMessages,
+  searchSessions,
   setSessionArchived,
   setSessionPinnedRemote,
   setSessionUnreadRemote,
@@ -287,6 +288,25 @@ describe('session reads pin the owner connection (#125372)', () => {
     expect(hermesApi.mock.calls[0][0]).toMatchObject({
       connectionId: 'other-conn',
       profile: 'tommy'
+    })
+  })
+})
+
+describe('searchSessions profile scoping', () => {
+  it('scopes the full-text search to the active profile', async () => {
+    // Regression: searchSessions sent only ?q=, so the request landed unscoped
+    // on the serving backend's own profile. With the desktop backend serving
+    // `default` and the window on another profile, the sidebar search returned
+    // default-profile rows and never a row of the window's own profile. The
+    // sibling reads here spread profileScoped(); this one must too.
+    hermesApi.mockResolvedValue({ results: [] } as never)
+    vi.mocked(client.profileScoped).mockReturnValue({ profile: 'sibilla', priority: 'foreground' })
+
+    await searchSessions('Bucharest')
+
+    expect(hermesApi.mock.calls[0][0]).toMatchObject({
+      path: '/api/sessions/search?q=Bucharest',
+      profile: 'sibilla'
     })
   })
 })

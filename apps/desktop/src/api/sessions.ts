@@ -427,6 +427,8 @@ export function setSessionUnreadRemote(id: string, unread: boolean, profile?: st
 
 export function searchSessions(query: string): Promise<SessionSearchResponse> {
   return hermesApi<SessionSearchResponse>({
+    // Scope the search to the active profile, like the sibling reads above.
+    ...profileScoped(),
     path: `/api/sessions/search?q=${encodeURIComponent(query)}`
   })
 }
