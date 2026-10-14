@@ -728,9 +728,10 @@ def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
     assert not dm_file.exists()
 
 
-def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
+def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, monkeypatch, capsys):
     """#100523: the CLI's single-owner lease refusal is a delivery FAILURE the
-    sender can read, not a raw exit-1 with the payload silently gone."""
+    sender can read, not a raw exit-1 with the payload silently gone. The retry
+    schedule is pinned empty here; the bounded retry has its own tests below."""
     dm_file = tmp_path / "message.txt"
     dm_file.write_text("hi", encoding="utf-8")
     child = tmp_path / "owned.py"
@@ -740,6 +741,7 @@ def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
         "raise SystemExit(1)\n",
         encoding="utf-8",
     )
+    monkeypatch.setattr(bot_mode_dm, "_REFUSAL_RETRY_WAITS", ())
 
     returncode = bot_mode_dm._run_delivery(
         [sys.executable, str(child), "-p", "ops"], str(dm_file), stdin_file=False
@@ -748,6 +750,79 @@ def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
     assert returncode == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["reason"] == "target_busy"
+
+
+def test_refusal_retry_delivers_once_the_lease_frees(tmp_path, monkeypatch, capsys):
+    """2026-10-14 fork patch: a SESSION_NOT_OWNED refusal is a lease report, not a busy agent
+    (the holder is usually the other leg of the same round trip still winding down) — the
+    runner retries the SAME payload on the bounded schedule and delivers instead of dropping
+    the message."""
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("hi", encoding="utf-8")
+    counter = tmp_path / "attempts"
+    child = tmp_path / "flaky.py"
+    child.write_text(
+        "import pathlib, sys\n"
+        "tally = pathlib.Path(sys.argv[1])\n"
+        "count = int(tally.read_text()) if tally.exists() else 0\n"
+        "tally.write_text(str(count + 1))\n"
+        "if count == 0:\n"
+        "    print('hermes-refusal-reason: SESSION_NOT_OWNED', file=sys.stderr)\n"
+        "    print('Session abc already has a live owner (cli, pid 2).', file=sys.stderr)\n"
+        "    raise SystemExit(1)\n"
+        "print('PONG')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bot_mode_dm, "_REFUSAL_RETRY_WAITS", (0.0, 0.0))
+
+    returncode = bot_mode_dm._run_delivery(
+        [sys.executable, str(child), str(counter), "-p", "ops"], str(dm_file), stdin_file=False
+    )
+
+    assert returncode == 0
+    assert capsys.readouterr().out.strip() == "PONG"
+    assert counter.read_text(encoding="utf-8") == "2"
+    assert not dm_file.exists()
+
+
+def test_refusal_retry_exhausts_the_bounded_schedule(tmp_path, monkeypatch, capsys):
+    """The retry window is bounded: a holder that outlives every wait still ends in the typed
+    refusal — with honest text (the lease stayed held; no claim the chat is 'busy')."""
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("hi", encoding="utf-8")
+    counter = tmp_path / "attempts"
+    child = tmp_path / "owned.py"
+    child.write_text(
+        "import pathlib, sys\n"
+        "tally = pathlib.Path(sys.argv[1])\n"
+        "count = int(tally.read_text()) if tally.exists() else 0\n"
+        "tally.write_text(str(count + 1))\n"
+        "print('hermes-refusal-reason: SESSION_NOT_OWNED', file=sys.stderr)\n"
+        "print('Session abc already has a live owner (cli, pid 2).', file=sys.stderr)\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bot_mode_dm, "_REFUSAL_RETRY_WAITS", (0.0, 0.0))
+
+    returncode = bot_mode_dm._run_delivery(
+        [sys.executable, str(child), str(counter), "-p", "ops"], str(dm_file), stdin_file=False
+    )
+
+    assert returncode == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reason"] == "target_busy"
+    assert "3 attempts" in payload["error"]
+    assert "busy" not in payload["error"].lower()
+    assert counter.read_text(encoding="utf-8") == "3"
+    assert not dm_file.exists()
+
+
+def test_refusal_retry_schedule_is_bounded():
+    """The schedule is a design decision: long enough to outlast a winding-down leg, short
+    enough that the sender still gets an outcome inside the DM latency class."""
+    waits = bot_mode_dm._REFUSAL_RETRY_WAITS
+    assert waits and all(wait > 0 for wait in waits)
+    assert sum(waits) <= 300
 
 
 def test_local_turn_reemits_empty_stdout_for_a_bare_silence_marker(tmp_path, capsys):

@@ -50,6 +50,13 @@ _DM_DIR_NAME = "hermes-dm"
 _DM_STALE_SECONDS = 24 * 60 * 60
 _LIVE_WAIT_SECONDS = 300
 
+# A SESSION_NOT_OWNED refusal is a lease report, not a busy agent: the holder is usually the
+# other leg of the same round trip still winding down (or a headless one-shot turn), and the
+# turn never started — no row, no model call — so retrying the SAME payload cannot duplicate
+# anything. The runner waits out the holder on this bounded schedule before reporting the
+# refusal. FORK ADDITION, damko 2026-10-14 (fleet decision; upstream #122370).
+_REFUSAL_RETRY_WAITS = (10.0, 30.0, 60.0, 120.0)
+
 # '<peer>/<agent>' — peer names are lowercase (``hermes peer`` normalizes them).
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
 # Same shape as ``tools.bot_relay._HANDLE_RE`` (kept local: see import note above).
@@ -453,41 +460,63 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool):
     return acquire_turn_lock(_hermes_root(Path(_default_home())), argv[2])
 
 
+def _lease_refused(proc) -> bool:
+    """Whether a finished CLI turn was refused because another surface holds the session
+    lease. The CLI writes ``hermes-refusal-reason: SESSION_NOT_OWNED`` on stderr; older
+    CLIs without the marker get the historical wording fallback, and a code wins over
+    prose (including unknown codes from newer CLIs)."""
+    stderr_text = proc.stderr or ""
+    reason = next((line.removeprefix("hermes-refusal-reason: ").strip()
+                   for line in stderr_text.splitlines()
+                   if line.startswith("hermes-refusal-reason: ")), None)
+    refused_not_owned = (reason == "SESSION_NOT_OWNED" if reason is not None
+                         else "already has a live owner" in stderr_text)
+    return refused_not_owned and proc.returncode != 0
+
+
 def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None) -> int:
     """One Bot Chat turn via ``--query-file`` (plus one policy-gated retry); re-emits
     the transport's streams and returns its exit code. Transient failures re-run the
     same session; a context_overflow re-run lets the retried turn's pre-API compaction
-    compact the transcript first (no fresh session is ever minted). Auth/quota/config never retry."""
+    compact the transcript first (no fresh session is ever minted). Auth/quota/config never retry.
+    A lease refusal (``SESSION_NOT_OWNED``) is retried on ``_REFUSAL_RETRY_WAITS`` first — the
+    refused turn never ran, so replaying the same payload cannot double-deliver
+    (FORK ADDITION, damko 2026-10-14)."""
 
     def _turn(turn_env=env):
         return subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, encoding="utf-8", errors="replace", env=turn_env)
 
-    proc = _turn()
-    if proc.returncode != 0:
-        from tools.bot_failure_reasons import RETRY_NONE, classify_agent_error, retry_action, turn_failure_text
-        from tools.bot_relay import retry_turn_env
+    def _attempt():
+        proc = _turn()
+        if proc.returncode != 0:
+            from tools.bot_failure_reasons import RETRY_NONE, classify_agent_error, retry_action, turn_failure_text
+            from tools.bot_relay import retry_turn_env
 
-        # The re-run replays the same session and payload; the failed attempt already persisted the
-        # user row, so the retried process is told to resume it (RESUME_UNANSWERED_TURN_ENV).
-        if retry_action(classify_agent_error(turn_failure_text(proc.stdout, proc.stderr))) != RETRY_NONE:
-            proc = _turn(retry_turn_env(env))
-    stderr_text = proc.stderr or ""
-    reason = next((line.removeprefix("hermes-refusal-reason: ").strip()
-                   for line in stderr_text.splitlines()
-                   if line.startswith("hermes-refusal-reason: ")), None)
-    # A code wins over prose, including unknown codes from newer CLIs.
-    # Only older CLIs without a marker need the historical wording fallback.
-    refused_not_owned = (reason == "SESSION_NOT_OWNED" if reason is not None
-                         else "already has a live owner" in stderr_text)
-    if proc.returncode != 0 and refused_not_owned:
-        # The target's Bot Chat is held live by another surface (Desktop); the turn
-        # never ran — tell the sender plainly instead of leaking a raw lease error.
-        # See #100523.
+            # The re-run replays the same session and payload; the failed attempt already persisted the
+            # user row, so the retried process is told to resume it (RESUME_UNANSWERED_TURN_ENV).
+            if retry_action(classify_agent_error(turn_failure_text(proc.stdout, proc.stderr))) != RETRY_NONE:
+                proc = _turn(retry_turn_env(env))
+        return proc
+
+    proc = _attempt()
+    retries, waited = 0, 0.0
+    for wait_seconds in _REFUSAL_RETRY_WAITS:
+        if not _lease_refused(proc):
+            break
+        time.sleep(wait_seconds)
+        retries, waited = retries + 1, waited + wait_seconds
+        proc = _attempt()
+    if _lease_refused(proc):
+        # A lease held by another surface — usually the other leg of a round trip still
+        # winding down — is not a busy agent. The vendor dropped the message here (#100523);
+        # FORK ADDITION, damko 2026-10-14: report honestly after the bounded retry above.
         who = argv[argv.index("-p") + 1] if "-p" in argv[:-1] else "the teammate"
+        detail = f"{retries + 1} attempts over ~{round(waited)}s" if retries else "one attempt"
         print(json.dumps({
-            "error": f"Delivery failed: @{who}'s Bot Chat is open on another "
-                     "surface right now, so your message was NOT delivered. Try again later.",
+            "error": f"Delivery failed: @{who}'s Bot Chat stayed held by another surface for the "
+                     f"whole retry window ({detail}), so your message was NOT delivered. The holder "
+                     "is usually the other leg of a round trip still winding down; re-send once it frees.",
             "reason": "target_busy",
         }))
         return 1
@@ -616,7 +645,8 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
     session; a context_overflow re-run lets the retried turn's pre-API compaction pass compact the Bot Chat
     transcript first (agent/conversation_loop.py) — the sanctioned compression lever; no fresh session is
     ever minted. Auth/quota/config failures never retry. Peer transports (stdin mode) retry on their own
-    gateway's deliver path, not here.
+    gateway's deliver path, not here. A lease refusal (``SESSION_NOT_OWNED``) is retried on
+    ``_REFUSAL_RETRY_WAITS`` before the typed refusal is reported (FORK ADDITION, damko 2026-10-14).
     """
     # The live consumer owns turn admission; never compete for its CLI lease.
     if not stdin_file:
