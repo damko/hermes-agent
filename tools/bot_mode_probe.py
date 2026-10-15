@@ -198,6 +198,8 @@ def local_alias_map(root: Path) -> dict[str, set[str]]:
     def _build() -> dict[str, set[str]]:
         aliases: dict[str, set[str]] = {}
         for name, profile_dir in _roster(root):
+            if not _is_bot_managed(profile_dir):
+                continue
             for form in set().union(*(alias_forms(f) for f in _friendly_names(profile_dir))):
                 aliases.setdefault(form, set()).add(name)
         return aliases
@@ -228,7 +230,7 @@ def _remote_roster(root: Path) -> list[dict]:
 def local_taken_forms(root: Path) -> set[str]:
     """Bare forms this gateway's own profiles answer to (handles + friendly-name slugs); a remote
     row must not be offered under any of them, since local resolution wins (``_resolve_local_name``)."""
-    return {_handle(name) for name, _d in _roster(root)} | set(local_alias_map(root))
+    return {_handle(name) for name, d in _roster(root) if _is_bot_managed(d)} | set(local_alias_map(root))
 
 
 def _remote_paragraph(root: Path) -> str:
@@ -271,7 +273,7 @@ def _build_section(home: Path) -> str:
     if not _any_managed(root):
         return ""
 
-    roster_lines = [_bullet(f"@{_handle(name)}", _profile_role(d)) for name, d in _roster(root) if name != me]
+    roster_lines = [_bullet(f"@{_handle(name)}", _profile_role(d)) for name, d in _roster(root) if name != me and _is_bot_managed(d)]
     roster_block = "\n".join(roster_lines) or "- (no teammates yet)"
 
     return (

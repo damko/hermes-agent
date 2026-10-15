@@ -244,8 +244,8 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     home = _agent_home(agent)
     try:
         from tools.bot_mode_probe import (
-            _display_name, _handle, _hermes_root, _peers, _profile_name as _self_profile_name,
-            _roster, is_bot_mode_managed,
+            _display_name, _handle, _hermes_root, _is_bot_managed, _peers,
+            _profile_name as _self_profile_name, _roster, is_bot_mode_managed,
         )
         from tools.bot_relay import BOT_CHAT_TURN_ARGS, _hermes_cli
 
@@ -261,7 +261,11 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     record_feature_used("bot_mode", hermes_home=home)
 
     root, me = _hermes_root(Path(home)), _self_profile_name(Path(home))
-    roster_homes = dict(_roster(root))
+    # Only Bot-Mode-managed profiles are DM teammates: a stock "default" husk (no
+    # ui_meta.hermes-bots marker, no provider) must not capture a bare "@hermes" that the
+    # relay roster could route to a real agent, and must not be advertised as a teammate.
+    # FORK ADDITION, damko 2026-10-15 (fleet DM-lane fix, card t_43cea3b5).
+    roster_homes = {name: d for name, d in _roster(root) if _is_bot_managed(d)}
     roster = list(roster_homes)
     peers = _peers(root)
     teammates = [_handle(n) for n in roster if n != me]
@@ -303,8 +307,13 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         # under the wrong interpreter (#108628). _hermes_cli pins the entrypoint beside
         # this interpreter; _delivery_lock/_local_delivery_home match argv[0] by basename,
         # so the absolute path stays compatible.
+        # A bare peer name targets the peer's MAIN agent (its default profile) — on a
+        # single-profile remote install that is a stock husk. Name the transport form so a
+        # husk delivery is visible in the ack. FORK ADDITION, damko 2026-10-15.
+        peer_label = (f"@{peer_profile} on peer '{peer_name}'" if peer_profile
+                      else f"@{peer_name} (the peer's main agent) on peer '{peer_name}'")
         return _start_delivery([_hermes_cli(), "-p", _self_profile_name(root), "peer", "dm", dm_target], content,
-                               f"@{peer_profile or peer_name} on peer '{peer_name}'", stdin_file=True,
+                               peer_label, stdin_file=True,
                                author=peer_author, **delivery)
 
     # A connection-qualified target ('hermes@mini') names a relay row outright; it is the form the relay itself
