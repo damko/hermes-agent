@@ -768,6 +768,12 @@ def _rule_dispatcher_host_conflict(task, events, runs, now, cfg) -> list[Diagnos
     hosts in one task's history (at most one of them can be this host)."""
     window = _positive_int(cfg.get("host_conflict_window_seconds"),
                            DEFAULT_CONFIG["host_conflict_window_seconds"])
+    # Exempt: done/archived. A finished card needs no attention — its cross-host
+    # history is a record of a past race, and the 24h window kept the banner
+    # shouting about six already-completed cards (2026-10-23). running is NOT
+    # exempt: a live card held by two hosts is the conflict this rule exists for.
+    if _task_field(task, "status") in ("done", "archived"):
+        return []
     local = _local_host_prefix()
     steal_ts, steal_lock, steal_kind = 0, "", ""
     prefix_ts: dict[str, int] = {}
