@@ -221,3 +221,77 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+def test_dispatcher_host_conflict_fires_on_cross_host_reclaim():
+    """A reclaim whose claim belonged to another host is a two-dispatcher
+    config conflict, not a repeated agent failure (2026-10-21: bee:2224)."""
+    now = int(time.time())
+    events = [
+        _event("claimed", ts=now - 1200, lock="bee:2224"),
+        _event("reclaimed", ts=now - 600, stale_lock="bee:2224",
+               host_local=False, cross_host=True),
+    ]
+    diags = kd.compute_task_diagnostics(_task(status="blocked"), events, [], now=now)
+    found = [d for d in diags if d.kind == "dispatcher_host_conflict"]
+    assert found, [d.kind for d in diags]
+    d = found[0]
+    assert d.severity == "error"
+    assert d.data["conflict"] == "two_dispatcher_hosts"
+    assert d.data["stale_lock"] == "bee:2224"
+    assert "bee" in d.title
+    assert d.actions and d.actions[-1].kind == "unblock"
+
+
+def test_dispatcher_host_conflict_fires_on_foreign_deferral():
+    """Holding a live foreign claim is recorded as ``reclaim_deferred`` with
+    ``host_local: False`` — also proof of a second dispatcher host."""
+    now = int(time.time())
+    events = [
+        _event("reclaim_deferred", ts=now - 100, claim_lock="bee:20749",
+               host_local=False, reason="foreign_host_claim_live"),
+    ]
+    diags = kd.compute_task_diagnostics(
+        _task(status="running", claim_lock="bee:20749"), events, [], now=now)
+    assert [d.kind for d in diags if d.kind == "dispatcher_host_conflict"]
+
+
+def test_dispatcher_host_conflict_fires_on_two_claim_hosts_without_reclaim():
+    """Two distinct claimer hosts on one task prove two dispatchers even when
+    neither side has reclaimed yet. At most one of them can be this host."""
+    now = int(time.time())
+    events = [
+        _event("claimed", ts=now - 3000, lock="bee:100"),
+        _event("claimed", ts=now - 1000, lock="u-dam-dev:200"),
+    ]
+    diags = kd.compute_task_diagnostics(
+        _task(status="running", claim_lock="u-dam-dev:200"), events, [], now=now)
+    found = [d for d in diags if d.kind == "dispatcher_host_conflict"]
+    assert found
+    assert found[0].severity == "warning"
+    assert found[0].data["claim_hosts"] == ["bee:", "u-dam-dev:"]
+
+
+def test_dispatcher_host_conflict_silent_on_one_host():
+    """Normal single-dispatcher operation must never raise this diagnostic."""
+    now = int(time.time())
+    events = [
+        _event("claimed", ts=now - 600, lock="bee:100"),
+        _event("reclaimed", ts=now - 300, stale_lock="bee:100",
+               host_local=True, cross_host=False),
+        _event("claimed", ts=now - 200, lock="bee:300"),
+    ]
+    diags = kd.compute_task_diagnostics(
+        _task(status="running", claim_lock="bee:300"), events, [], now=now)
+    assert [d for d in diags if d.kind == "dispatcher_host_conflict"] == []
+
+
+def test_dispatcher_host_conflict_ignores_events_outside_window():
+    """A conflict older than ``host_conflict_window_seconds`` is not current."""
+    now = int(time.time())
+    events = [
+        _event("reclaimed", ts=now - 3 * 86400, stale_lock="bee:2224",
+               host_local=False, cross_host=True),
+    ]
+    diags = kd.compute_task_diagnostics(_task(status="ready"), events, [], now=now)
+    assert [d for d in diags if d.kind == "dispatcher_host_conflict"] == []
