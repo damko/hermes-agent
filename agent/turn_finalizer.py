@@ -53,6 +53,13 @@ def _record_kanban_budget_exhausted(
     consecutive-failure circuit breaker. Idempotent via the ``_end_run`` CAS
     (``WHERE ended_at IS NULL``), so safe from multiple exit paths.
 
+    ``outcome="timed_out"`` is kept deliberately. The dispatcher, ``_retry_status_for_run``
+    and the wake/ping kind maps all key on that value, and ``task_runs.outcome`` is
+    schema-visible: a new outcome would need a migration plus every consumer taught about
+    it, and any consumer that silently ignores an unknown value loses the run. The event
+    carries ``stop_reason="budget_exhausted"`` instead, so the operator notification names
+    the iteration budget rather than a runtime cap that was never set.
+
     This is a bounded fallback (#87096): the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``)
     guarantees idempotence — if another path already closed the run this is a no-op — so it is safe to call
     from multiple exit paths.
@@ -73,7 +80,11 @@ def _record_kanban_budget_exhausted(
                 outcome="timed_out",
                 release_claim=True,
                 end_run=True,
-                event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},
+                event_payload_extra={
+                    "stop_reason": "budget_exhausted",
+                    "budget_used": api_call_count,
+                    "budget_max": max_iterations,
+                },
             )
         finally:
             with suppress(Exception):

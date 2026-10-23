@@ -1419,6 +1419,12 @@ def _record_task_failure(
                 detail = {"failures": failures, "retry_status": retry_status}
                 if infrastructure:
                     detail["infrastructure"] = True
+                if event_payload_extra:
+                    # The caller's structured stop reason (a budget counter pair, a real
+                    # runtime cap) is the only trustworthy cause on the event. Dropping it
+                    # here left the notification formatter with prose and a default, and
+                    # the default it printed was ``max_runtime=0s``.
+                    detail.update(event_payload_extra)
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )

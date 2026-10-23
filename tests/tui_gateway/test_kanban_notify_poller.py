@@ -247,7 +247,35 @@ class TestFormatKanbanEventText:
     def test_timed_out_with_bad_payload_does_not_raise(self):
         ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": "not-a-number"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
-        assert "timed out" in text
+        # An unreadable limit is not a limit: neutral wording, never a fabricated 0s cap.
+        assert "max_runtime" not in text
+        assert "stopped without a completion report" in text
+
+    def test_budget_stop_names_the_iterations_and_no_runtime_cap(self):
+        # The exact payload the dispatcher records for a budget stop.
+        ev = SimpleNamespace(kind="timed_out", payload={
+            "error": "Iteration budget exhausted (150/150) — task could not complete within the allowed iterations",
+            "failures": 1,
+            "retry_status": "ready",
+            "stop_reason": "budget_exhausted",
+            "budget_used": 150,
+            "budget_max": 150,
+        })
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "iterations=150/150" in text
+        assert "max_runtime" not in text
+        assert "0s" not in text
+
+    def test_real_runtime_cap_prints_the_cap(self):
+        ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": 3600})
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "max_runtime=3600s" in text
+        assert "iterations=" not in text
+
+    def test_budget_counters_without_stop_reason_name_the_budget(self):
+        ev = SimpleNamespace(kind="timed_out", payload={"budget_used": 40, "budget_max": 40})
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "iterations=40/40" in text
 
 
 class TestNotificationPollerLoopKanbanWiring:

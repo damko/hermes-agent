@@ -336,9 +336,26 @@ def _kb_completed(task, payload: dict, title: str) -> str:
 
 
 def _kb_timed_out(task, payload: dict, title: str) -> str:
+    """Name the stop reason the event records; never invent a limit.
+
+    A run stops for reasons that are not a timeout — the iteration budget is the usual one.
+    ``limit_seconds`` is absent unless a runtime cap really caused the stop, so rendering it
+    as ``max_runtime=0s`` (the old wording) sent the reader after a knob nobody had touched.
+    The dispatcher now writes ``stop_reason``, ``budget_used`` and ``budget_max`` into the
+    event payload; read those, and fall back to neutral wording rather than a fabricated
+    number. Prose in ``payload["error"]`` is deliberately NOT parsed — legacy rows get the
+    neutral wording, new rows carry the fields.
+    """
+    used, cap = payload.get("budget_used"), payload.get("budget_max")
+    if payload.get("stop_reason") == "budget_exhausted" or (used is not None and cap is not None):
+        with contextlib.suppress(TypeError, ValueError):
+            return (f" stopped at its iteration budget (iterations={int(used)}/{int(cap)});"
+                    " will retry")
     with contextlib.suppress(TypeError, ValueError):
-        return f" timed out (max_runtime={int(payload.get('limit_seconds') or 0)}s); will retry"
-    return " timed out (max_runtime=0s); will retry"
+        limit = int(payload.get("limit_seconds") or 0)
+        if limit > 0:
+            return f" ran past its max_runtime={limit}s cap; will retry"
+    return " stopped without a completion report; will retry"
 
 
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.

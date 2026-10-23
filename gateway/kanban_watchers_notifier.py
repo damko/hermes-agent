@@ -460,9 +460,27 @@ def _fmt_gave_up(ev, n) -> tuple:
 
 
 def _fmt_timed_out(ev, n) -> tuple:
-    limit = int(_payload(ev, "limit_seconds") or 0)
-    minutes = max(1, round(limit / 60)) if limit else 0
-    span = t("gateway.kanban.ping.limit_minutes", minutes=minutes) if minutes else t("gateway.kanban.ping.limit_generic")
+    """Name the stop cause the event records; a budget stop is not a timeout.
+
+    ``limit_seconds`` is absent unless a runtime cap really stopped the run, so the old
+    wording could only say "its time limit" for a stop that used none. The event now
+    carries ``stop_reason``/``budget_used``/``budget_max``: read the fields, keep the
+    runtime wording for a real cap, and stay neutral when the cause is not recorded.
+    """
+    used, cap = _payload(ev, "budget_used"), _payload(ev, "budget_max")
+    if _payload(ev, "stop_reason") == "budget_exhausted" or (used is not None and cap is not None):
+        try:
+            return t("gateway.kanban.ping.budget_exhausted", head=n.head,
+                     used=int(used), cap=int(cap)), None, None
+        except (TypeError, ValueError):
+            pass
+    try:
+        limit = int(_payload(ev, "limit_seconds") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if not limit:
+        return t("gateway.kanban.ping.stopped", head=n.head), None, None
+    span = t("gateway.kanban.ping.limit_minutes", minutes=max(1, round(limit / 60)))
     return t("gateway.kanban.ping.timed_out", head=n.head, span=span), None, None
 
 
