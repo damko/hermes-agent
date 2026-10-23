@@ -634,11 +634,82 @@ class TurnBusyError(RuntimeError):
 
     reason = "target_busy"
 
-    def __init__(self, profile: str, waited_seconds: float):
+    def __init__(self, profile: str, waited_seconds: float, holder_pid: int = 0,
+                 holder_elapsed: float = 0.0):
         self.profile, self.waited_seconds = profile, waited_seconds
-        super().__init__(f"target_busy: another delivery turn is already running for profile '{profile}' — "
-                         f"queued behind it for ~{round(waited_seconds)}s without it finishing. "
-                         "The message was NOT delivered; retry shortly.")
+        self.holder_pid, self.holder_elapsed = int(holder_pid or 0), float(holder_elapsed or 0.0)
+        # The sender must be able to tell "queued behind a live turn" from "the target is broken":
+        # name the holding pid and how long it has run, not just the profile.
+        holder = (f" (held by pid {self.holder_pid} for {format_elapsed(self.holder_elapsed)})"
+                  if self.holder_pid else "")
+        super().__init__(f"target_busy: another delivery turn is already running for profile '{profile}'"
+                         f"{holder} — queued behind it for {format_elapsed(waited_seconds)} without it "
+                         "finishing. The message was NOT delivered; retry shortly.")
+
+
+def format_elapsed(seconds: float) -> str:
+    """Compact human duration: 16m24s / 7s / 1h02m."""
+    total = int(max(0.0, float(seconds or 0.0)))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _write_lock_holder(fd: int) -> None:
+    """Record ``<pid> <start_epoch>`` inside the lockfile so a blocked waiter can name the
+    holder. Advisory text only: flock, not the file content, is the lock."""
+    try:
+        payload = f"{os.getpid()} {int(time.time())}".encode()
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, payload)
+    except OSError:  # pragma: no cover — metadata must never break the lock
+        logger.debug("bot turn lock: holder metadata write failed", exc_info=True)
+
+
+def _clear_lock_holder(fd: int) -> None:
+    try:
+        os.ftruncate(fd, 0)
+    except OSError:  # pragma: no cover
+        pass
+
+
+def turn_lock_holder(root: Path | str, profile: str) -> tuple[int, float]:
+    """``(pid, elapsed_seconds)`` of the live turn holding ``profile``'s lock, else ``(0, 0.0)``."""
+    try:
+        text = turn_lock_path(root, profile).read_text(encoding="utf-8").strip()
+        pid_text, start_text = text.split()[:2]
+        return int(pid_text), max(0.0, time.time() - float(start_text))
+    except (OSError, ValueError):
+        return 0, 0.0
+
+
+def turn_lock_busy(root: Path | str, profile: str) -> bool:
+    """Non-blocking probe: is a turn (or anything else) holding ``profile``'s lock right now?"""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover — Windows
+        return False
+    path = turn_lock_path(root, profile)
+    if not path.exists():
+        return False
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        except OSError:
+            return True
+    finally:
+        os.close(fd)
 
 
 def turn_wait_seconds() -> float:
@@ -681,11 +752,15 @@ def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | N
             except OSError:
                 now = time.monotonic()
                 if now >= deadline:
-                    raise TurnBusyError(profile, now - start)
+                    holder_pid, holder_elapsed = turn_lock_holder(root, profile)
+                    raise TurnBusyError(profile, now - start, holder_pid, holder_elapsed)
                 time.sleep(min(0.1, max(0.005, deadline - now)))
+        # Stamp the holder so a blocked sender can report "pid N, running for Nm Ns".
+        _write_lock_holder(fd)
         try:
             yield path
         finally:
+            _clear_lock_holder(fd)
             with contextlib.suppress(OSError):  # kernel releases on close anyway
                 fcntl.flock(fd, fcntl.LOCK_UN)
     finally:

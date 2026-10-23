@@ -378,3 +378,23 @@ def test_roster_resolves_default_to_root_home_over_stray_directory(tmp_path):
     assert homes["researcher"] == home / "profiles" / "researcher"
     names = [name for name, _ in roster]
     assert names.count("default") == 1
+
+
+def test_dm_teammate_gate_keeps_the_primary_and_refuses_a_husk(tmp_path):
+    """The DM roster gate (card t_14847046): a Bot-Mode-managed profile is a teammate, a husk
+    is not, and the primary 'default' is a teammate even without the marker.
+
+    Locked because the two live forks disagree: damai carries the narrow ``_is_bot_managed``
+    filter plus ``test_unmanaged_default_husk_is_not_a_dm_teammate``, this install carries the
+    widened ``_dm_teammate``. Only the widened form survives an unmarked primary — the narrow
+    one turns every bare ``@hermes`` DM into "No teammate named 'hermes'" (t_14847046).
+    """
+    marked = _make_bot_profile(tmp_path, "samu", managed=True)
+    husk = _make_bot_profile(tmp_path, "husk", managed=False)
+    primary_husk = _make_bot_profile(tmp_path, "default", managed=False)
+
+    assert bot_mode_probe._dm_teammate("samu", marked) is True
+    assert bot_mode_probe._dm_teammate("husk", husk) is False, "a husk must never capture a DM"
+    assert bot_mode_probe._dm_teammate("default", primary_husk) is True, (
+        "the primary profile is a teammate even without ui_meta.hermes-bots"
+    )

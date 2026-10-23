@@ -74,7 +74,7 @@ class _FakeAgent:
 # ── injection gate (leak containment) ────────────────────────────────────────
 
 
-def test_injects_only_into_bot_chat_on_managed_install(tmp_path):
+def test_injects_into_a_bot_chat_on_managed_install(tmp_path):
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")
     assert bot_mode_dm.ensure_message_agent_tool(agent) is True
@@ -85,6 +85,39 @@ def test_injects_only_into_bot_chat_on_managed_install(tmp_path):
     # idempotent: second call adds nothing (byte-stable tool list per turn)
     assert bot_mode_dm.ensure_message_agent_tool(agent) is True
     assert len(agent.tools) == 1
+
+
+@pytest.mark.parametrize("title", ["", "My research chat", "Group: room-abc123", "handoff-12ab34cd"])
+def test_injects_into_an_ordinary_session_on_managed_install(tmp_path, title):
+    """FORK CONTRACT (damko 2026-09-30): sibilla, claudio and every other agent must be
+    able to reach diogene from an ORDINARY session — the tool is no longer Bot-Chat-only.
+    The teammate roster ships with it (agent/system_prompt.py, same predicate)."""
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title=title)
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is True
+    names = [t["function"]["name"] for t in agent.tools]
+    assert names == [bot_mode_dm.MESSAGE_AGENT_TOOL_NAME]
+    assert bot_mode_dm.MESSAGE_AGENT_TOOL_NAME in agent.valid_tool_names
+
+
+@pytest.mark.parametrize("source", ["desktop", "cli", "oneshot", "cron", "telegram"])
+def test_ordinary_sources_are_not_worker_excluded(tmp_path, monkeypatch, source):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", source)
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Any session")
+    assert bot_mode_dm.dm_worker_excluded(agent) is False
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is True
+
+
+def test_kanban_worker_turn_gets_no_tool(tmp_path, monkeypatch):
+    """A worker turn keeps its card lane: its session has no live surface for the answer."""
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="kanban task t_abc")
+    assert bot_mode_dm.dm_worker_excluded(agent) is True
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
 
 
 def test_restores_allowlist_when_schema_survives_surface_refresh(tmp_path):
@@ -115,9 +148,10 @@ def test_restores_allowlist_when_schema_survives_surface_refresh(tmp_path):
     "title",
     ["", "My research chat", "Group: room-abc123", "handoff-12ab34cd"],
 )
-def test_never_injects_outside_bot_chat(tmp_path, title):
-    """CLI sessions, ordinary chats, group-room member sessions: no tool."""
-    home = _managed_home(tmp_path)
+def test_never_injects_on_an_unmanaged_install_for_any_title(tmp_path, title):
+    """A plain install stays tool-free in every session — the install marker is the gate."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
     agent = _FakeAgent(home, title=title)
     assert bot_mode_dm.ensure_message_agent_tool(agent) is False
     assert agent.tools == []
@@ -155,14 +189,16 @@ def test_schema_never_in_global_registry():
 # ── dispatch gate (defense in depth) ─────────────────────────────────────────
 
 
-def test_tool_refuses_outside_bot_chat(tmp_path):
+def test_tool_refuses_a_kanban_worker_turn(tmp_path, monkeypatch):
+    """Defense in depth for the one excluded source (fork contract 2026-09-30)."""
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
     home = _managed_home(tmp_path)
-    agent = _FakeAgent(home, title="Ordinary chat")
+    agent = _FakeAgent(home, title="kanban task t_abc")
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
     )
     assert "error" in result
-    assert "Bot Chat" in result["error"]
+    assert "consultation card" in result["error"]
 
 
 def test_tool_refuses_on_unmanaged_install(tmp_path):
@@ -875,9 +911,10 @@ def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
     assert not dm_file.exists()
 
 
-def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
+def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, monkeypatch, capsys):
     """#100523: the CLI's single-owner lease refusal is a delivery FAILURE the
-    sender can read, not a raw exit-1 with the payload silently gone."""
+    sender can read, not a raw exit-1 with the payload silently gone. The retry
+    schedule is pinned empty here; the bounded retry has its own tests below."""
     dm_file = tmp_path / "message.txt"
     dm_file.write_text("hi", encoding="utf-8")
     child = tmp_path / "owned.py"
@@ -887,6 +924,7 @@ def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
         "raise SystemExit(1)\n",
         encoding="utf-8",
     )
+    monkeypatch.setattr(bot_mode_dm, "_REFUSAL_RETRY_WAITS", ())
 
     returncode = bot_mode_dm._run_delivery(
         [sys.executable, str(child), "-p", "ops"], str(dm_file), stdin_file=False
@@ -895,6 +933,79 @@ def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
     assert returncode == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["reason"] == "target_busy"
+
+
+def test_refusal_retry_delivers_once_the_lease_frees(tmp_path, monkeypatch, capsys):
+    """2026-10-14 fork patch: a SESSION_NOT_OWNED refusal is a lease report, not a busy agent
+    (the holder is usually the other leg of the same round trip still winding down) — the
+    runner retries the SAME payload on the bounded schedule and delivers instead of dropping
+    the message."""
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("hi", encoding="utf-8")
+    counter = tmp_path / "attempts"
+    child = tmp_path / "flaky.py"
+    child.write_text(
+        "import pathlib, sys\n"
+        "tally = pathlib.Path(sys.argv[1])\n"
+        "count = int(tally.read_text()) if tally.exists() else 0\n"
+        "tally.write_text(str(count + 1))\n"
+        "if count == 0:\n"
+        "    print('hermes-refusal-reason: SESSION_NOT_OWNED', file=sys.stderr)\n"
+        "    print('Session abc already has a live owner (cli, pid 2).', file=sys.stderr)\n"
+        "    raise SystemExit(1)\n"
+        "print('PONG')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bot_mode_dm, "_REFUSAL_RETRY_WAITS", (0.0, 0.0))
+
+    returncode = bot_mode_dm._run_delivery(
+        [sys.executable, str(child), str(counter), "-p", "ops"], str(dm_file), stdin_file=False
+    )
+
+    assert returncode == 0
+    assert capsys.readouterr().out.strip() == "PONG"
+    assert counter.read_text(encoding="utf-8") == "2"
+    assert not dm_file.exists()
+
+
+def test_refusal_retry_exhausts_the_bounded_schedule(tmp_path, monkeypatch, capsys):
+    """The retry window is bounded: a holder that outlives every wait still ends in the typed
+    refusal — with honest text (the lease stayed held; no claim the chat is 'busy')."""
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("hi", encoding="utf-8")
+    counter = tmp_path / "attempts"
+    child = tmp_path / "owned.py"
+    child.write_text(
+        "import pathlib, sys\n"
+        "tally = pathlib.Path(sys.argv[1])\n"
+        "count = int(tally.read_text()) if tally.exists() else 0\n"
+        "tally.write_text(str(count + 1))\n"
+        "print('hermes-refusal-reason: SESSION_NOT_OWNED', file=sys.stderr)\n"
+        "print('Session abc already has a live owner (cli, pid 2).', file=sys.stderr)\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bot_mode_dm, "_REFUSAL_RETRY_WAITS", (0.0, 0.0))
+
+    returncode = bot_mode_dm._run_delivery(
+        [sys.executable, str(child), str(counter), "-p", "ops"], str(dm_file), stdin_file=False
+    )
+
+    assert returncode == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reason"] == "target_busy"
+    assert "3 attempts" in payload["error"]
+    assert "busy" not in payload["error"].lower()
+    assert counter.read_text(encoding="utf-8") == "3"
+    assert not dm_file.exists()
+
+
+def test_refusal_retry_schedule_is_bounded():
+    """The schedule is a design decision: long enough to outlast a winding-down leg, short
+    enough that the sender still gets an outcome inside the DM latency class."""
+    waits = bot_mode_dm._REFUSAL_RETRY_WAITS
+    assert waits and all(wait > 0 for wait in waits)
+    assert sum(waits) <= 300
 
 
 def test_local_turn_reemits_empty_stdout_for_a_bare_silence_marker(tmp_path, capsys):
@@ -920,15 +1031,17 @@ def test_query_file_delivery_closes_stdin_for_initial_attempt_and_retry(
     dm_file.write_text("secret", encoding="utf-8")
     calls = []
     responses = [
-        subprocess.CompletedProcess([], 1, stdout="", stderr="HTTP 429 rate limit"),
-        subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+        bot_mode_dm._TurnOutcome(returncode=1, stdout="", stderr="HTTP 429 rate limit"),
+        bot_mode_dm._TurnOutcome(returncode=0, stdout="", stderr=""),
     ]
 
-    def fake_run(argv, **kwargs):
-        calls.append((argv, kwargs))
+    # The turn seam is _run_turn_watched (idle watchdog, fork addition 2026-10-23), not
+    # subprocess.run: stdin closure is covered behaviourally by test_dm_queue_watchdog.py.
+    def fake_turn(argv, *, idle_seconds, env=None, turn_cap_seconds=0.0):
+        calls.append((argv, idle_seconds))
         return responses.pop(0)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(bot_mode_dm, "_run_turn_watched", fake_turn)
 
     returncode = bot_mode_dm._run_delivery(
         ["hermes", "-p", "researcher"], str(dm_file), stdin_file=False
@@ -936,10 +1049,7 @@ def test_query_file_delivery_closes_stdin_for_initial_attempt_and_retry(
 
     assert returncode == 0
     assert len(calls) == 2
-    assert [kwargs["stdin"] for _argv, kwargs in calls] == [
-        subprocess.DEVNULL,
-        subprocess.DEVNULL,
-    ]
+    assert [argv[-2:] for argv, _idle in calls] == [["--query-file", str(dm_file)]] * 2
     assert not dm_file.exists()
 
 
@@ -957,11 +1067,18 @@ def test_delivery_main_child_env_carries_only_the_argv_author(tmp_path, monkeypa
     dm_file.write_text("secret", encoding="utf-8")
     calls = []
 
+    # query-file turns run through _run_turn_watched (idle watchdog, fork addition 2026-10-23);
+    # stdin transports still call subprocess.run directly. Both seams record the child env.
+    def fake_turn(argv, *, idle_seconds, env=None, turn_cap_seconds=0.0):
+        calls.append((argv, {"env": env}))
+        return bot_mode_dm._TurnOutcome(returncode=0, stdout="", stderr="")
+
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(bot_mode_dm, "_run_turn_watched", fake_turn)
+    monkeypatch.setattr(bot_mode_dm.subprocess, "run", fake_run)
     monkeypatch.setenv("HERMES_DM_TEST_MARKER", "kept")
     monkeypatch.setenv(TURN_AUTHOR_ENV, json.dumps({"id": "bot:previous", "name": "previous", "is_bot": True}))
     author_args = ["--author", json.dumps(author)] if author else []

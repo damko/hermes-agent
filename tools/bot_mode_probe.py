@@ -118,6 +118,17 @@ def _is_bot_managed(profile_dir: Path) -> bool:
     return _bots_meta(_read_yaml_dict(profile_dir / "profile.yaml", "hermes-bots")) is not None
 
 
+def _dm_teammate(name: str, profile_dir: Path) -> bool:
+    """Is ``name`` a DM teammate? Bot-Mode-managed profiles, plus the PRIMARY profile.
+
+    The primary ('default', the bot the relay advertises as ``@hermes``) is the install's
+    default agent even when its profile.yaml carries no marker, and every ``@hermes`` DM
+    targets it: filtering it out silently turned those DMs into "No teammate named
+    'hermes'" and hid its friendly name from ``local_alias_map`` (t_14847046).
+    """
+    return name == "default" or _is_bot_managed(profile_dir)
+
+
 def _any_managed(root: Path) -> bool:
     return any(_is_bot_managed(d) for _n, d in _roster(root))
 
@@ -198,6 +209,8 @@ def local_alias_map(root: Path) -> dict[str, set[str]]:
     def _build() -> dict[str, set[str]]:
         aliases: dict[str, set[str]] = {}
         for name, profile_dir in _roster(root):
+            if not _dm_teammate(name, profile_dir):
+                continue
             for form in set().union(*(alias_forms(f) for f in _friendly_names(profile_dir))):
                 aliases.setdefault(form, set()).add(name)
         return aliases
@@ -228,7 +241,7 @@ def _remote_roster(root: Path) -> list[dict]:
 def local_taken_forms(root: Path) -> set[str]:
     """Bare forms this gateway's own profiles answer to (handles + friendly-name slugs); a remote
     row must not be offered under any of them, since local resolution wins (``_resolve_local_name``)."""
-    return {_handle(name) for name, _d in _roster(root)} | set(local_alias_map(root))
+    return {_handle(name) for name, d in _roster(root) if _dm_teammate(name, d)} | set(local_alias_map(root))
 
 
 def _remote_paragraph(root: Path) -> str:
@@ -271,7 +284,8 @@ def _build_section(home: Path) -> str:
     if not _any_managed(root):
         return ""
 
-    roster_lines = [_bullet(f"@{_handle(name)}", _profile_role(d)) for name, d in _roster(root) if name != me]
+    roster_lines = [_bullet(f"@{_handle(name)}", _profile_role(d))
+                    for name, d in _roster(root) if name != me and _dm_teammate(name, d)]
     roster_block = "\n".join(roster_lines) or "- (no teammates yet)"
 
     return (
@@ -420,7 +434,7 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     surface["skills"] = _swallow(_skills, [])
     try:
         roster = _roster(root)
-        surface["roster"] = sorted(n for n, d in roster if _is_bot_managed(d))
+        surface["roster"] = sorted(n for n, d in roster if _dm_teammate(n, d))
         # Roles are part of the messaging surface: renaming a bot or editing a
         # description must refresh the roster block teammates pick recipients from.
         surface["roster_roles"] = sorted(f"{n}:{_profile_role(d)}" for n, d in roster)

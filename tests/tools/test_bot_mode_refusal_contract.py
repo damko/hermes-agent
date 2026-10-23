@@ -5,7 +5,10 @@ from types import SimpleNamespace
 from tools import bot_mode_dm
 
 
-def test_delivery_uses_refusal_code_before_human_wording(tmp_path, capsys):
+def test_delivery_uses_refusal_code_before_human_wording(tmp_path, monkeypatch, capsys):
+    # The bounded refusal retry is exercised in test_bot_mode_dm; pin it empty here so
+    # this contract test stays a single attempt per code.
+    monkeypatch.setattr(bot_mode_dm, "_REFUSAL_RETRY_WAITS", ())
     for code, message, busy in (
         ("SESSION_NOT_OWNED", "Ce chat est occupé.", True),
         ("SESSION_COORDINATION_UNAVAILABLE", "Cannot verify whether session already has a live owner", False),
