@@ -736,8 +736,96 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _local_host_prefix() -> str:
+    """``"<host>:"`` prefix of the claim locks THIS host issues — the same
+    formula as ``kanban_db._host_prefix``. Duplicated rather than imported:
+    ``kanban_db`` pulls this module in, so a top-level import would cycle.
+    Empty string = unknown, and the rule then trusts event payloads only."""
+    try:
+        import socket
+        return f"{socket.gethostname() or 'unknown'}:"
+    except Exception:  # pragma: no cover - gethostname() is effectively total
+        return ""
+
+
+def _rule_dispatcher_host_conflict(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """This task's claim was written by ANOTHER dispatcher host.
+
+    Two Hermes installs dispatching against one kanban home cannot coordinate:
+    ``.dispatcher.lock`` is an flock, and an flock is not shared across a
+    filesystem mounted by two kernels (host + Qubes AppVM on one home), so each
+    side keeps expiring the other's claims. The victim card is then booked as
+    failing although its own agent never ran (2026-10-21: ``stale_lock=bee:2224``
+    -> ``gave_up`` on six cards). That is a CONFIGURATION conflict, not
+    ``repeated_failures``: the fix is to stop one dispatcher, not to re-run the
+    card. Fires on a cross-host reclaim/deferral, or on two distinct claimer
+    hosts in one task's history (at most one of them can be this host)."""
+    window = _positive_int(cfg.get("host_conflict_window_seconds"),
+                           DEFAULT_CONFIG["host_conflict_window_seconds"])
+    local = _local_host_prefix()
+    steal_ts, steal_lock = 0, ""
+    prefix_ts: dict[str, int] = {}
+    for ev in events:
+        kind = _event_kind(ev)
+        if kind not in {"claimed", "reclaimed", "reclaim_deferred"}:
+            continue
+        ts = _event_ts(ev)
+        if ts <= 0 or now - ts > window:
+            continue
+        payload = _parse_payload(ev)
+        lock = str(payload.get("lock") or payload.get("claim_lock")
+                   or payload.get("stale_lock") or "")
+        host = f"{lock.split(':', 1)[0]}:" if ":" in lock else ""
+        if host and kind == "claimed":
+            prefix_ts[host] = max(prefix_ts.get(host, 0), ts)
+        foreign = payload.get("host_local") is False or (
+            kind == "reclaim_deferred"
+            and str(payload.get("reason") or "") == "foreign_host_claim_live"
+        )
+        if foreign and ts >= steal_ts:
+            steal_ts, steal_lock = ts, lock
+    if not steal_ts and len(prefix_ts) < 2:
+        return []
+
+    hosts = sorted(prefix_ts)
+    if steal_ts:
+        severity = "error"
+        other = steal_lock.split(":", 1)[0] if ":" in steal_lock else "another host"
+        title = f"Claim taken over from another dispatcher host ({other})"
+        detail = (
+            f"The claim {steal_lock!r} on this task was issued by host {other!r}, not by this "
+            f"machine, and this machine then expired it. Two Hermes installs are dispatching "
+            f"against the same kanban home, so each one reclaims the other's cards and this task "
+            f"is booked as failing although its own agent never ran. Stop the dispatcher on ONE "
+            f"host (keep the host that has the worker toolchains), then re-run this card."
+        )
+    else:
+        severity = "warning"
+        title = "Two dispatcher hosts claimed this task"
+        detail = (
+            f"This task has been claimed by {len(hosts)} different hosts ({', '.join(hosts)}). "
+            f"Only one dispatcher may run per kanban home; two dispatchers expire each other's "
+            f"claims and fail cards that never ran. Stop the dispatcher on ONE host."
+        )
+    actions = [
+        _cli_hint("Check dispatcher status", "hermes kanban diagnostics"),
+        _log_hint_action(_task_field(task, "id", "") or ""),
+        DiagnosticAction(kind="unblock", label="Re-run the card", payload={}),
+    ]
+    return [Diagnostic(
+        kind="dispatcher_host_conflict", severity=severity,
+        title=title, detail=detail, actions=actions,
+        first_seen_at=steal_ts or max(prefix_ts.values()), last_seen_at=steal_ts or max(prefix_ts.values()),
+        count=1,
+        data={"conflict": "two_dispatcher_hosts", "local_host_prefix": local,
+              "stale_lock": steal_lock or None, "claim_hosts": hosts,
+              "window_seconds": int(window)},
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
+    _rule_dispatcher_host_conflict,
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
@@ -762,6 +850,10 @@ DEFAULT_CONFIG = {
     # Below 30 min the signal is dominated by tasks about to be claimed on
     # the next dispatcher tick.
     "stranded_threshold_seconds": 30 * 60,
+    # How far back to look for a claim written by another dispatcher host.
+    # A day: the conflict is a standing misconfiguration and both sides
+    # reclaim each other's cards for as long as it lasts.
+    "host_conflict_window_seconds": 24 * 60 * 60,
 }
 
 

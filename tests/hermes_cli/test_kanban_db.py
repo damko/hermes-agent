@@ -2084,3 +2084,88 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+def test_foreign_host_claim_with_fresh_heartbeat_is_held_not_reclaimed(kanban_home):
+    """Two dispatchers on one kanban home cannot coordinate: a claim issued by
+    ANOTHER host must be HELD while it still heartbeats, never expired.
+    ``_terminate_reclaimed_worker`` refuses to signal a foreign PID, so
+    "termination not attempted" says nothing about the worker being dead.
+    2026-10-21: this host stole ``stale_lock=bee:2224`` 15 min after its last
+    heartbeat and booked another host's run as this card's own failure."""
+    import json
+
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="foreign live", assignee="a")
+        kb.claim_task(conn, t, claimer="bee:20749")
+        kbd._set_worker_pid(conn, t, 999999)
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+            (now - 60, now - 900, t),
+        )
+        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 0
+        row = conn.execute(
+            "SELECT status, claim_lock, consecutive_failures FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["claim_lock"] == "bee:20749"
+        assert row["consecutive_failures"] == 0
+        deferred = [e for e in kb.list_events(conn, t) if e.kind == "reclaim_deferred"]
+        assert deferred, "expected reclaim_deferred, not a steal"
+        payload = deferred[-1].payload
+        payload = json.loads(payload) if isinstance(payload, str) else payload
+        assert payload["reason"] == "foreign_host_claim_live"
+        assert payload["host_local"] is False
+        assert [e for e in kb.list_events(conn, t) if e.kind == "reclaimed"] == []
+
+
+def test_foreign_host_claim_with_stale_heartbeat_does_not_count_failure(kanban_home):
+    """A claim left behind by another host IS reclaimed once its heartbeat has
+    gone stale, but it is an infrastructure condition, not an agent failure:
+    ``consecutive_failures`` stays put and the breaker cannot trip on it."""
+    import json
+
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="foreign dead", assignee="a")
+        kb.claim_task(conn, t, claimer="bee:20749")
+        kbd._set_worker_pid(conn, t, 999999)
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+            (now - 60, now - 7200, t),
+        )
+        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
+        row = conn.execute(
+            "SELECT status, claim_lock, consecutive_failures FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["claim_lock"] is None
+        assert row["consecutive_failures"] == 0
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        assert "gave_up" not in kinds
+        reclaimed = [e for e in kb.list_events(conn, t) if e.kind == "reclaimed"][-1]
+        payload = reclaimed.payload
+        payload = json.loads(payload) if isinstance(payload, str) else payload
+        assert payload["host_local"] is False
+        assert payload["cross_host"] is True
+
+
+def test_foreign_claim_without_heartbeat_is_not_wedged(kanban_home):
+    """A foreign claim that never heartbeated carries no progress signal, so it
+    must still be reclaimed — otherwise one absent host wedges the card forever."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="foreign silent", assignee="a")
+        kb.claim_task(conn, t, claimer="bee:20749")
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = NULL WHERE id = ?",
+            (int(time.time()) - 60, t),
+        )
+        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
+        row = conn.execute(
+            "SELECT status, consecutive_failures FROM tasks WHERE id = ?", (t,),
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["consecutive_failures"] == 0

@@ -2395,6 +2395,24 @@ def release_stale_claims(
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
         )
+        # A claim issued by ANOTHER dispatcher host cannot be liveness-checked
+        # from here: the PID means nothing in this namespace and
+        # ``_terminate_reclaimed_worker`` refuses to signal it, so "not
+        # terminated" says nothing about whether the worker is dead. Two
+        # dispatchers on one kanban home is a CONFIG CONFLICT, not a dead
+        # worker: while the foreign claim still shows observable progress
+        # (heartbeat inside ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS``) the
+        # claim is HELD and never expired. Silently stealing it was what booked
+        # another host's run as this card's own failure (2026-10-21,
+        # ``stale_lock=bee:2224`` -> ``gave_up`` on six innocent cards).
+        # A foreign claim with NO heartbeat at all carries no progress signal;
+        # it falls through to the reclaim below (booked as infrastructure).
+        if not host_local and hb is not None and not heartbeat_stale:
+            _defer_reclaim_for_live_worker(
+                conn, row["id"], row["claim_lock"], now, termination,
+                reason="foreign_host_claim_live",
+            )
+            continue
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
@@ -2425,6 +2443,7 @@ def release_stale_claims(
                     "last_heartbeat_at": hb,
                     "now": now,
                     "host_local": host_local,
+                    "cross_host": not host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
                     "retry_status": retry_status,
                 },
@@ -2433,11 +2452,20 @@ def release_stale_claims(
         # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
         # the run ended without a verdict, so it counts toward the breaker and a
         # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
+        # EXCEPT when the claim belonged to another dispatcher host: nothing about
+        # this card ran here, so it is an infrastructure condition, not an agent
+        # failure — ``consecutive_failures`` is left alone and the breaker cannot
+        # trip on it (2026-10-21: six cards blocked for a claim stolen from bee).
         _record_task_failure(
             conn, row["id"], f"stale_lock={row['claim_lock']}",
             outcome="reclaimed", failure_limit=failure_limit,
             release_claim=False, end_run=False,
-            event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
+            event_payload_extra={
+                "worker_pid": _opt_int(row["worker_pid"]),
+                "retry_status": retry_status,
+                "cross_host": not host_local,
+            },
+            infrastructure=not host_local,
         )
         # Post-commit observer; every non-reclaim branch ``continue``d above.
         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
