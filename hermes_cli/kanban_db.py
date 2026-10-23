@@ -1033,6 +1033,44 @@ def _host_prefix() -> str:
     return f"{_claimer_id().split(':', 1)[0]}:"
 
 
+def _instantiation_epoch() -> str:
+    """Per-kernel identity: ``gateway.drain_control.current_instantiation_epoch``
+    (``boot_id`` + PID-1 start time). Changes on every reboot or container
+    recreate, so it separates two kernels that share one ``~/.hermes`` even when
+    their hostnames and their PIDs collide. Empty string = unavailable."""
+    try:
+        from gateway.drain_control import current_instantiation_epoch
+        return str(current_instantiation_epoch() or "")
+    except Exception:
+        return ""
+
+
+def _claim_is_local(claim_lock: Optional[str], worker_started_at) -> bool:
+    """True when ``claim_lock`` was issued by THIS kernel.
+
+    A hostname is not proof of locality: host ``bee`` and a Qubes AppVM can
+    share both a name and a filesystem, and each kernel then mounts the same
+    kanban DB. The restart-stable fingerprint recorded at spawn
+    (``worker_started_at`` = ``"<instantiation epoch>|<start time>"``, see
+    ``kanban_db_dispatch._process_fingerprint``) settles it: a claim carrying
+    THIS kernel's epoch is local, and any other epoch is another kernel
+    whatever the hostname says. No usable fingerprint (legacy row, or an
+    unverified spawn) falls back to the hostname comparison, and a lock with no
+    ``host:`` prefix is never read as foreign — an unparsable claim keeps the
+    pre-existing local behaviour instead of earning infrastructure accounting
+    it may not deserve.
+    """
+    prefix = _host_prefix()
+    lock = str(claim_lock or "")
+    named_local = lock.startswith(prefix) if prefix else True
+    recorded = str(worker_started_at or "")
+    claimed_epoch = recorded.split("|", 1)[0] if "|" in recorded else ""
+    local_epoch = _instantiation_epoch()
+    if claimed_epoch and local_epoch:
+        return claimed_epoch == local_epoch
+    return named_local
+
+
 # --- Task creation / mutation ---
 
 def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -2372,7 +2410,6 @@ def release_stale_claims(
     """
     now = int(time.time())
     reclaimed = 0
-    host_prefix = _host_prefix()
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
         "       assignee "
@@ -2381,7 +2418,7 @@ def release_stale_claims(
         "  AND claim_expires < ?", (now,),
     ).fetchall()
     for row in stale:
-        host_local = (row["claim_lock"] or "").startswith(host_prefix)
+        host_local = _claim_is_local(row["claim_lock"], _row_get(row, "worker_started_at"))
         hb = _to_epoch(row["last_heartbeat_at"])
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
@@ -2395,6 +2432,24 @@ def release_stale_claims(
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
         )
+        # A claim issued by ANOTHER dispatcher host cannot be liveness-checked
+        # from here: the PID means nothing in this namespace and
+        # ``_terminate_reclaimed_worker`` refuses to signal it, so "not
+        # terminated" says nothing about whether the worker is dead. Two
+        # dispatchers on one kanban home is a CONFIG CONFLICT, not a dead
+        # worker: while the foreign claim still shows observable progress
+        # (heartbeat inside ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS``) the
+        # claim is HELD and never expired. Silently stealing it was what booked
+        # another host's run as this card's own failure (2026-10-21,
+        # ``stale_lock=bee:2224`` -> ``gave_up`` on six innocent cards).
+        # A foreign claim with NO heartbeat at all carries no progress signal;
+        # it falls through to the reclaim below (booked as infrastructure).
+        if not host_local and hb is not None and not heartbeat_stale:
+            _defer_reclaim_for_live_worker(
+                conn, row["id"], row["claim_lock"], now, termination,
+                reason="foreign_host_claim_live",
+            )
+            continue
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
@@ -2425,6 +2480,7 @@ def release_stale_claims(
                     "last_heartbeat_at": hb,
                     "now": now,
                     "host_local": host_local,
+                    "cross_host": not host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
                     "retry_status": retry_status,
                 },
@@ -2433,11 +2489,20 @@ def release_stale_claims(
         # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
         # the run ended without a verdict, so it counts toward the breaker and a
         # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
+        # EXCEPT when the claim belonged to another dispatcher host: nothing about
+        # this card ran here, so it is an infrastructure condition, not an agent
+        # failure — ``consecutive_failures`` is left alone and the breaker cannot
+        # trip on it (2026-10-21: six cards blocked for a claim stolen from bee).
         _record_task_failure(
             conn, row["id"], f"stale_lock={row['claim_lock']}",
             outcome="reclaimed", failure_limit=failure_limit,
             release_claim=False, end_run=False,
-            event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
+            event_payload_extra={
+                "worker_pid": _opt_int(row["worker_pid"]),
+                "retry_status": retry_status,
+                "cross_host": not host_local,
+            },
+            infrastructure=not host_local,
         )
         # Post-commit observer; every non-reclaim branch ``continue``d above.
         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
