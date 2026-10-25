@@ -507,7 +507,13 @@ class MemoryStore:
         if act not in ("replace", "remove", "patch"):
             return f"{pos}: unknown action. Use add, patch, or remove.", None, "invalid_args", None
         if not old_text.strip():
-            return f"{pos}: old_text is required.", None, "missing_old_text", None
+            # A `remove` carries no new text, so its `content` can only name the entry to drop:
+            # accept that as the selector. Models drop the old_text field when they restate the
+            # entry in `content`, and a rejected batch applies NOTHING while burning the turn.
+            if act == "remove" and content.strip():
+                old_text = content
+            else:
+                return f"{pos}: old_text is required.", None, "missing_old_text", None
         if act == "replace" and not content:
             return (f"{pos}: content is required — set this operation object's own 'content' to the COMPLETE "
                     f"new entry (or use action='remove' to delete)."), None, "missing_content", None
