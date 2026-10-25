@@ -411,11 +411,11 @@ MEMORY_SCHEMA = {
             },
             "content": {
                 "type": "string",
-                "description": "Required for 'add' and 'patch'. For 'add', the new entry. For 'patch', the text that replaces old_text; the rest of the entry is kept. Alias: 'new_text'."
+                "description": "Required for 'add' and 'patch'. For 'add', the new entry. For 'patch', the text that replaces old_text; the rest of the entry is kept. Alias: 'new_text'. In a batch, a 'remove' may name its entry here."
             },
             "old_text": {
                 "type": "string",
-                "description": "REQUIRED for 'patch' and 'remove': text from one entry. 'patch' replaces exactly this span (it must occur once in the entry); 'remove' deletes the whole entry. Omit for 'add'."
+                "description": "REQUIRED for 'patch', and for a single-op 'remove' outside a batch: text from one entry. 'patch' replaces exactly this span (must occur once in the entry); 'remove' deletes the whole entry. In a batch a 'remove' may use 'content' instead. Omit for 'add'."
             },
             "new_text": {
                 "type": "string",
@@ -432,7 +432,7 @@ MEMORY_SCHEMA = {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["add", "patch", "remove"]},
-                        "content": {"type": "string", "description": "Required for add and patch, as 'content' above."},
+                        "content": {"type": "string", "description": "As 'content' above; in a batch a 'remove' may name its entry here."},
                         "new_text": {"type": "string", "description": "Alias for 'content' in a batch op."},
                         "old_text": {"type": "string", "description": "As 'old_text' above."},
                     },
