@@ -368,6 +368,39 @@ def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
 
 
+# FORK PATCH (damko fleet): the memory-recall indicator ("👁️ Hindsight — recalled N memories")
+# is a per-step lifecycle line. On a chat surface it is noise and, in a room carrying a peer
+# agent, one more inbound message; on the desktop it is the only proof that memory was injected.
+# Gate it per platform, absent key -> stock behaviour (line shown).
+_RECALL_INDICATOR_RE = re.compile(r"recalled\s+\d+\s+memor(?:y|ies)", re.IGNORECASE)
+
+_TRUE_WORDS = frozenset({"true", "1", "yes", "on"})
+
+
+def _gateway_memory_recall_indicator_enabled(platform: Any) -> bool:
+    """True when the memory-recall status line may reach this chat surface.
+
+    Reads ``display.platforms.<platform>.memory_recall_indicator``, then the global
+    ``display.memory_recall_indicator``; absent from both -> True (stock behaviour).
+    Read live (mtime-cached) so a config edit applies at the next status; fail-open on a
+    read error so a broken config never hides a notice.
+    """
+    name = _gateway_platform_value(platform)
+    try:
+        config = _load_gateway_config()
+        display = config.get("display") if isinstance(config, dict) else None
+        if not isinstance(display, dict):
+            return True
+        platforms = display.get("platforms")
+        scoped = platforms.get(name) if isinstance(platforms, dict) else None
+        for holder in (scoped, display):
+            if isinstance(holder, dict) and "memory_recall_indicator" in holder:
+                return str(holder.get("memory_recall_indicator")).strip().lower() in _TRUE_WORDS
+        return True
+    except Exception:
+        return True
+
+
 _GATEWAY_PROVIDER_POLICY_RE = re.compile(
     r"("  # raw provider policy/safety bodies are noisy and may be sensitive
     r"cybersecurity\s+risk"
@@ -730,6 +763,10 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return None
     if _gateway_surface_passes_raw_text(platform):
         return text
+
+    # FORK PATCH (damko fleet): per-platform memory-recall indicator gate (see the helper above).
+    if _RECALL_INDICATOR_RE.search(text) and not _gateway_memory_recall_indicator_enabled(platform):
+        return None
 
     text = _redact_gateway_user_facing_secrets(text)
     # Opt-in `compression.progress_notices` lets ROUTINE (template-derived) progress through; other noise stays.
