@@ -82,19 +82,26 @@ def _skills_dir() -> Path:
     return configured if configured != _SKILLS_DIR_AT_IMPORT else get_hermes_home() / "skills"
 
 
-def _skill_lock_path(name: str) -> Path:
+def _skill_lock_path(name: str, identity: str | None = None) -> Path:
     """Per-skill lock file under ``<skills>/.locks/`` (same idiom as the usage ledger's
     ``.usage.json.lock``), never inside the skill dir so delete/recreate cannot unlink it under a
     waiting writer. Keyed by a digest of the basename so ``foo`` and ``category/foo`` share one
-    lock and no name can hit a filesystem limit (callers validate the basename first)."""
-    digest = hashlib.sha256(Path(name).name.encode("utf-8", "surrogatepass")).hexdigest()
+    lock and no name can hit a filesystem limit (callers validate the basename first).
+
+    ``identity`` is the skill's RESOLVED directory on disk, when the caller already looked it up.
+    Two names can reach one skill — two links to one store directory is the shape of a shared
+    skills tree — and a name-keyed lock would let both writers read the same original content and
+    overwrite each other (review 2026-11-12). Callers that cannot resolve pass the name only.
+    """
+    basis = identity if identity else Path(name).name
+    digest = hashlib.sha256(basis.encode("utf-8", "surrogatepass")).hexdigest()
     return _skills_dir() / ".locks" / f"{digest}.lock"
 
 
-def _skill_mutation_lock(name: str):
+def _skill_mutation_lock(name: str, identity: str | None = None):
     """Exclusive lock held across one skill's whole read-modify-write; thread-re-entrant."""
     from tools.skill_usage import skill_file_lock
-    return skill_file_lock(_skill_lock_path(name))
+    return skill_file_lock(_skill_lock_path(name, identity=identity))
 
 
 def _skill_mutation_locks(names):
@@ -840,7 +847,17 @@ def skill_manage(
     # A mutation is read-modify-write even when its action eventually delegates
     # to a helper: guards, ledger capture, patch matching, validation, rollback,
     # and the atomic replacement all belong to the same ownership window.
-    with _skill_mutation_lock(name):
+    # Lock on the skill's IDENTITY, not the requested name: two names can reach one skill (two links
+    # into one store), and a name-keyed lock let both writers read the same original content and
+    # overwrite each other (review 2026-11-12). Resolution happens before the lock and only picks
+    # the lock file; a wrong guess is still one lock per name, never no lock at all.
+    _lock_identity = None
+    if action != "create":
+        with suppress(Exception):
+            _hit = _find_skill(name)
+            if _hit:
+                _lock_identity = str(Path(_hit["path"]).resolve())
+    with _skill_mutation_lock(name, identity=_lock_identity):
         # Ledger pre-capture: telemetry, not a gate — failures must NEVER block the mutation. delete
         # destroys the whole package (consolidation may have re-homed support files first), so
         # complete it from the newest curator backup or a restore is hollow.

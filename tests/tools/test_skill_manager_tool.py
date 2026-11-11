@@ -556,6 +556,48 @@ class TestSkillMutationLock:
             assert lock == _skill_lock_path("foo")
             assert lock.parent == tmp_path / ".locks"
 
+    def test_two_names_for_one_skill_share_the_lock(self, tmp_path):
+        """Two names reaching one skill must serialize on the SKILL, not on the name.
+
+        Real shape: two links in one skills root point at the same store directory (a shared skill
+        tree). With a name-keyed lock the two writers take different locks, read the same original
+        content, and the second overwrites the first (review 2026-11-12, P2).
+        """
+        from tools import skill_manager_tool as smt
+
+        store = tmp_path / "store" / "alpha"
+        store.mkdir(parents=True)
+        (store / "SKILL.md").write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+        identity = str(store.resolve())  # where alpha/zeta both land
+
+        with _skill_dir(tmp_path):
+            (tmp_path / "alpha").symlink_to(store, target_is_directory=True)
+            (tmp_path / "zeta").symlink_to(store, target_is_directory=True)
+            # same skill through two names -> one lock file
+            assert _skill_lock_path("alpha", identity=identity) == _skill_lock_path("zeta", identity=identity)
+            # ... and the name-only form still keeps distinct names apart (the old behaviour)
+            assert _skill_lock_path("alpha") != _skill_lock_path("zeta")
+
+            seen = {}
+
+            class _Recorder:
+                def __init__(self, name, identity=None):
+                    seen["name"] = name
+                    seen["identity"] = identity
+
+                def __enter__(self):
+                    return None
+
+                def __exit__(self, *exc):
+                    return False
+
+            with patch.object(smt, "_skill_mutation_lock", _Recorder):
+                result = json.loads(skill_manage(
+                    action="patch", name="zeta", old_string="# Test Skill", new_string="# Test Skill Z"))
+
+        assert result["success"] is True, result
+        assert seen["identity"] == identity, seen
+
 
 class TestDeleteSkill:
     def test_delete_cleans_empty_category_dir(self, tmp_path):
