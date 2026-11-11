@@ -230,21 +230,29 @@ def _iter_skill_dirs(root: Path):
     (``<home>/skills-external/<skill> -> ~/.hermes-custom-skills/<skill>``): the loader showed the
     skill as ``external / enabled`` while ``skill_manage`` answered "not found in active profile".
     Measured 2026-11-12: ``rglob`` found 0 of 28 links, ``os.walk(followlinks=True)`` found 28.
-    A visited ``(dev, ino)`` set stops a symlink cycle from looping forever.
+
+    Cycles are stopped per BRANCH, not globally: the ancestor inodes of each directory are carried
+    down the walk and a directory whose inode already appears in its own chain is pruned. A global
+    visited set would have been simpler and wrong — two links pointing at the same store directory
+    are two legitimate paths to one skill, and dropping the second would hide a skill the loader
+    lists (found by review 2026-11-12 on a root holding ``alpha`` and ``zeta`` -> one store dir).
     """
     from agent.skill_utils import is_excluded_skill_path
-    seen: set[tuple[int, int]] = set()
+    chains: dict[str, frozenset[tuple[int, int]]] = {str(root): frozenset()}
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         try:
             st = os.stat(dirpath)
         except OSError:
             dirnames[:] = []
             continue
-        key = (st.st_dev, st.st_ino)
-        if key in seen:
+        inode = (st.st_dev, st.st_ino)
+        chain = chains.get(dirpath, frozenset())
+        if inode in chain:  # this directory is its own ancestor: a symlink loop
             dirnames[:] = []
             continue
-        seen.add(key)
+        chain = chain | {inode}
+        for name in dirnames:
+            chains[os.path.join(dirpath, name)] = chain
         if "SKILL.md" in filenames:
             skill_md = Path(dirpath) / "SKILL.md"
             if not is_excluded_skill_path(skill_md):

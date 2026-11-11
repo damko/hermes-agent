@@ -1576,3 +1576,22 @@ class TestExternalSkillRoots:
         (store / "loop").symlink_to(tmp_path / "store", target_is_directory=True)
 
         assert [d.name for d in _iter_skill_dirs(tmp_path / "store")] == ["alpha"]
+
+    def test_two_links_to_one_store_are_both_yielded(self, tmp_path):
+        """Cycle protection must prune a branch, not the whole walk.
+
+        A global visited-inode set dropped the second link to the same store directory, so a skill
+        the loader lists under one alias could be reported "not found" by skill_manage depending on
+        directory order (found by review 2026-11-12).
+        """
+        from tools.skill_manager_tool import _iter_skill_dirs
+
+        store = tmp_path / "store" / "alpha"
+        store.mkdir(parents=True)
+        (store / "SKILL.md").write_text("---\nname: alpha\n---\n", encoding="utf-8")
+        external = tmp_path / "skills-external"
+        external.mkdir()
+        (external / "alpha").symlink_to(store, target_is_directory=True)
+        (external / "zeta").symlink_to(store, target_is_directory=True)
+
+        assert sorted(d.name for d in _iter_skill_dirs(external)) == ["alpha", "zeta"]
