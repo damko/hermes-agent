@@ -12,6 +12,7 @@ import hashlib
 import json
 from contextlib import ExitStack, suppress
 import logging
+import os
 import re
 import shutil
 from pathlib import Path
@@ -221,10 +222,33 @@ def _resolve_skill_dir(name: str, category: str | None = None) -> Path:
 
 
 def _iter_skill_dirs(root: Path):
+    """Yield every directory under ``root`` that holds a ``SKILL.md``.
+
+    Walks with ``os.walk(followlinks=True)``: ``Path.rglob`` does NOT descend into symlinked
+    directories, so a skills root whose children are links yielded nothing at all. That is exactly
+    the shape of ``skills.external_dirs`` on a fleet that shares skills through a store
+    (``<home>/skills-external/<skill> -> ~/.hermes-custom-skills/<skill>``): the loader showed the
+    skill as ``external / enabled`` while ``skill_manage`` answered "not found in active profile".
+    Measured 2026-11-12: ``rglob`` found 0 of 28 links, ``os.walk(followlinks=True)`` found 28.
+    A visited ``(dev, ino)`` set stops a symlink cycle from looping forever.
+    """
     from agent.skill_utils import is_excluded_skill_path
-    for skill_md in root.rglob("SKILL.md"):
-        if not is_excluded_skill_path(skill_md):
-            yield skill_md.parent
+    seen: set[tuple[int, int]] = set()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        try:
+            st = os.stat(dirpath)
+        except OSError:
+            dirnames[:] = []
+            continue
+        key = (st.st_dev, st.st_ino)
+        if key in seen:
+            dirnames[:] = []
+            continue
+        seen.add(key)
+        if "SKILL.md" in filenames:
+            skill_md = Path(dirpath) / "SKILL.md"
+            if not is_excluded_skill_path(skill_md):
+                yield skill_md.parent
 
 
 def _read_frontmatter_name(skill_md: Path) -> Optional[str]:

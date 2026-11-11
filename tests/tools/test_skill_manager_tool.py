@@ -1542,3 +1542,37 @@ class TestLockedGuard:
         assert autonomous["success"] is False, autonomous
         assert "could not be verified" in autonomous["error"], autonomous
         assert foreground["success"] is True, foreground
+
+
+class TestExternalSkillRoots:
+    """``skills.external_dirs`` is often a directory of SYMLINKS — the shape of a shared skill
+    store (``<home>/skills-external/<skill> -> ~/.hermes-custom-skills/<skill>``).
+
+    ``Path.rglob`` does NOT descend into symlinked directories, so the skill-manager lookup
+    reported "not found in active profile" for a skill the loader showed as external/enabled
+    (measured on the live fleet 2026-11-12: 0 of 28 links found, 28 with os.walk(followlinks)).
+    """
+
+    def test_symlinked_skill_dir_is_found(self, tmp_path):
+        from tools.skill_manager_tool import _iter_skill_dirs
+
+        store = tmp_path / "store" / "alpha"
+        store.mkdir(parents=True)
+        (store / "SKILL.md").write_text("---\nname: alpha\n---\n", encoding="utf-8")
+        external = tmp_path / "skills-external"
+        external.mkdir()
+        (external / "alpha").symlink_to(store, target_is_directory=True)
+
+        assert list(_iter_skill_dirs(external)) == [external / "alpha"]
+        # the old one-liner this replaced — kept as the reason the new walk exists
+        assert list(external.rglob("SKILL.md")) == []
+
+    def test_symlink_cycle_terminates(self, tmp_path):
+        from tools.skill_manager_tool import _iter_skill_dirs
+
+        store = tmp_path / "store" / "alpha"
+        store.mkdir(parents=True)
+        (store / "SKILL.md").write_text("---\nname: alpha\n---\n", encoding="utf-8")
+        (store / "loop").symlink_to(tmp_path / "store", target_is_directory=True)
+
+        assert [d.name for d in _iter_skill_dirs(tmp_path / "store")] == ["alpha"]
